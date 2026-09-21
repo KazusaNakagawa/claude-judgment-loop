@@ -1,0 +1,3 @@
+{"op": "new", "domain": "code-review", "trigger": "新機能に着手するとき", "rule": "実装・スキャフォールドから入らず、機能要件・設計ドキュメントを先に起こす", "rationale": "設計を飛ばすと、レビューで前提から覆されて手戻りが大きくなる", "source_ids": ["j_20260612_001"]}
+{"op": "add_evidence", "rule_id": "r_code_001", "source_ids": ["j_20260823_001"]}
+{"op": "activate", "rule_id": "r_code_001"}

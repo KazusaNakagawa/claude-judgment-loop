@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""judge — low-friction capture CLI for the judgment learning loop (layer 1).
+
+Records human verdicts (reject / revise / note) as one JSON object per line in
+judgments.jsonl. The only required human input is --reason; everything else is
+auto-filled or inherited.
+
+Data location (kept out of your config repo): $JUDGMENT_LOOP_DIR, default
+~/.local/share/judgment-loop/
+
+See README.md.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+VERDICTS = {
+    "reject": "rejected",
+    "revise": "revised",
+    "note": "accepted-with-note",
+}
+
+
+def data_dir() -> Path:
+    env = os.environ.get("JUDGMENT_LOOP_DIR")
+    base = Path(env) if env else Path.home() / ".local" / "share" / "judgment-loop"
+    return base
+
+
+def log_path() -> Path:
+    return data_dir() / "judgments.jsonl"
+
+
+def read_events() -> list[dict]:
+    """Tolerant read: skip malformed lines (warn on stderr) instead of crashing.
+
+    judgments.jsonl is append-only and meant to be eyeballed/hand-edited, so a
+    one-char corruption is realistic. Capture availability is the thing we must
+    never lose, and skipping is safe here because we never write this file back —
+    we only append. (Read-only log = tolerant; rules.jsonl = strict — see
+    distill-apply.)"""
+    path = log_path()
+    if not path.exists():
+        return []
+    events = []
+    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            print(
+                f"judge: skipping malformed line {lineno} in {path}",
+                file=sys.stderr,
+            )
+    return events
+
+
+def next_id(events: list[dict], now: datetime) -> str:
+    """j_{YYYYMMDD}_{NNN} — counter restarts each day."""
+    day = now.strftime("%Y%m%d")
+    prefix = f"j_{day}_"
+    used = []
+    for e in events:
+        eid = e.get("id")
+        if isinstance(eid, str) and eid.startswith(prefix):
+            try:
+                used.append(int(eid.rsplit("_", 1)[1]))
+            except ValueError:
+                pass  # a hand-mangled counter shouldn't break numbering
+    seq = (max(used) + 1) if used else 1
+    return f"{prefix}{seq:03d}"
+
+
+def last_domain(events: list[dict]) -> str | None:
+    for e in reversed(events):
+        if e.get("domain"):
+            return e["domain"]
+    return None
+
+
+def build_event(subcmd: str, args, events: list[dict], now: datetime) -> dict:
+    domain = args.domain or last_domain(events)
+    if not domain:
+        raise SystemExit(
+            "error: --domain is required (no prior event to inherit from)"
+        )
+
+    event = {
+        "id": next_id(events, now),
+        "ts": now.isoformat(timespec="seconds"),
+        "domain": domain,
+        "context": args.context or "",
+        "output_digest": args.digest or "",
+        "verdict": VERDICTS[subcmd],
+        "reason": args.reason,
+    }
+    if args.fix:
+        event["correction"] = args.fix
+    if args.tags:
+        event["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+    if args.model:
+        event["source_model"] = args.model
+    return event
+
+
+def append_event(event: dict) -> None:
+    path = log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def print_stats(events: list[dict]) -> None:
+    """A small, immediate reward: show the loop is compounding even before
+    rule injection exists, so the recording habit doesn't go cold."""
+    print(f"judgments recorded: {len(events)}")
+    if not events:
+        return
+    from collections import Counter
+    by_domain = Counter(e.get("domain", "?") for e in events)
+    by_verdict = Counter(e.get("verdict", "?") for e in events)
+    print("by domain:")
+    for dom, n in by_domain.most_common():
+        print(f"  {dom}: {n}")
+    print("by verdict: " + ", ".join(f"{v}={n}" for v, n in by_verdict.most_common()))
+    print(f"latest: {events[-1]['id']} ({events[-1]['ts']})")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="judge", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="subcmd", required=True)
+    for name, help_text in (
+        ("reject", "record a rejection"),
+        ("revise", "record a revision (with --fix)"),
+        ("note", "record an approval with a note"),
+    ):
+        sp = sub.add_parser(name, help=help_text)
+        sp.add_argument("--reason", required=True, help="why (the core human input)")
+        sp.add_argument("--domain", help="judgment domain; inherits last if omitted")
+        sp.add_argument("--fix", help="correction / how it should have been")
+        sp.add_argument("--context", help="what was being generated")
+        sp.add_argument("--digest", help="digest of the rejected output")
+        sp.add_argument("--tags", help="comma-separated tags")
+        sp.add_argument("--model", help="source model of the output")
+    sub.add_parser("stats", help="show cumulative capture counts (the reward)")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    events = read_events()
+    if args.subcmd == "stats":
+        print_stats(events)
+        return 0
+    now = datetime.now().astimezone()
+    event = build_event(args.subcmd, args, events, now)
+    append_event(event)
+    print(f"{event['id']}  [{event['verdict']}] {event['domain']}: {event['reason']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

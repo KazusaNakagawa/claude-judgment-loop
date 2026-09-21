@@ -1,0 +1,5 @@
+{"id": "j_20260612_001", "ts": "2026-06-12T21:10:04+09:00", "domain": "code-review", "context": "CSV エクスポート機能の追加", "output_digest": "", "verdict": "rejected", "reason": "新機能なのに、要件を確認せずいきなり実装を始めた", "correction": "機能要件と設計ドキュメントを先に起こし、合意してから実装する"}
+{"id": "j_20260701_001", "ts": "2026-07-01T22:37:17+09:00", "domain": "security", "context": "設計ドキュメントの追加", "output_digest": "", "verdict": "revised", "reason": "ドキュメントに個人の絶対パスをコミットした", "correction": "パスは書かず、ファイルの所在・性質で説明する"}
+{"id": "j_20260714_001", "ts": "2026-07-14T09:02:51+09:00", "domain": "code-review", "context": "", "output_digest": "", "verdict": "accepted-with-note", "reason": "改修したら関連 docs に乖離がないか確認し、同じ PR で更新する"}
+{"id": "j_20260810_001", "ts": "2026-08-10T18:07:39+09:00", "domain": "security", "context": "テストケースの追加", "output_digest": "", "verdict": "rejected", "reason": "public repo のテストに実データの値をそのまま書いた", "correction": "テストデータは架空の値で作る"}
+{"id": "j_20260823_001", "ts": "2026-08-23T08:05:53+09:00", "domain": "code-review", "context": "", "output_digest": "", "verdict": "rejected", "reason": "新機能は実装から入らず、機能要件・設計ドキュメントを先に起こす"}

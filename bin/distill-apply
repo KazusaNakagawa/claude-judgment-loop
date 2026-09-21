@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""distill-apply — apply a human-approved distillation patch to rules.jsonl.
+
+The `judgment-distill` Skill proposes diffs; a human approves them; this tool
+writes them. Deterministically. The LLM never rewrites rules.jsonl wholesale,
+so unrelated `active` rules can't be silently mangled or dropped.
+
+Patch format: one JSON op per line. Supported ops:
+
+  {"op":"new", "domain":..., "trigger":..., "rule":..., "rationale":...,
+   "source_ids":[...]}            -> add as tentative; evidence_count=#unique src
+  {"op":"add_evidence", "rule_id":..., "source_ids":[...]}
+                                  -> merge source_ids; evidence_count recomputed
+  {"op":"activate", "rule_id":...}  -> status=active (the human-approval gate)
+  {"op":"retire",   "rule_id":...}  -> status=retired
+
+evidence_count and source_ids are derived here, never taken from the LLM's word.
+Data dir: $JUDGMENT_LOOP_DIR (default ~/.local/share/judgment-loop/).
+"""
+
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DOMAIN_ABBR = {
+    "code-review": "code",
+    "writing": "write",
+}  # anything else falls back to its first 4 letters (workflow -> work)
+
+
+def data_dir() -> Path:
+    env = os.environ.get("JUDGMENT_LOOP_DIR")
+    return Path(env) if env else Path.home() / ".local" / "share" / "judgment-loop"
+
+
+def rules_path() -> Path:
+    return data_dir() / "rules.jsonl"
+
+
+def load_rules() -> list[dict]:
+    """Strict read: a malformed line ABORTS. Unlike judge's append-only log,
+    rules.jsonl is rewritten wholesale by write_rules(); silently skipping a bad
+    line would drop that rule on the next write. Read-only log = tolerant; a file
+    we write back = strict. The asymmetry is deliberate."""
+    path = rules_path()
+    if not path.exists():
+        return []
+    rules = []
+    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rules.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            raise SystemExit(
+                f"error: malformed rules.jsonl at line {lineno} ({e}); "
+                f"aborting without writing so no rule is lost"
+            )
+    return rules
+
+
+def load_patch(patch_path: str) -> list[dict]:
+    text = Path(patch_path).read_text()
+    return [json.loads(l) for l in text.splitlines() if l.strip()]
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def abbr(domain: str) -> str:
+    return DOMAIN_ABBR.get(domain, domain.replace("-", "")[:4] or "gen")
+
+
+def next_rule_id(rules: list[dict], domain: str) -> str:
+    prefix = f"r_{abbr(domain)}_"
+    used = [
+        int(r["rule_id"].rsplit("_", 1)[1])
+        for r in rules
+        if isinstance(r.get("rule_id"), str) and r["rule_id"].startswith(prefix)
+    ]
+    return f"{prefix}{(max(used) + 1) if used else 1:03d}"
+
+
+def find(rules: list[dict], rule_id: str) -> dict:
+    for r in rules:
+        if r.get("rule_id") == rule_id:
+            return r
+    raise SystemExit(f"error: unknown rule_id '{rule_id}'")
+
+
+def apply_op(rules: list[dict], op: dict) -> None:
+    kind = op.get("op")
+    if kind == "new":
+        missing = [k for k in ("domain", "trigger", "rule") if not op.get(k)]
+        if missing:
+            raise SystemExit(f"error: 'new' op missing required field(s): {', '.join(missing)}")
+        src = sorted(set(op.get("source_ids", [])))
+        if not src:
+            raise SystemExit(
+                "error: 'new' requires source_ids — a rule with no evidence is "
+                "untraceable and can't be verified or retired"
+            )
+        rules.append({
+            "rule_id": next_rule_id(rules, op["domain"]),
+            "domain": op["domain"],
+            "trigger": op["trigger"],
+            "rule": op["rule"],
+            "rationale": op.get("rationale", ""),
+            "source_ids": src,
+            "evidence_count": len(src),
+            "status": "tentative",
+            "updated_at": now_iso(),
+        })
+    elif kind == "add_evidence":
+        r = find(rules, op["rule_id"])
+        merged = sorted(set(r.get("source_ids", [])) | set(op.get("source_ids", [])))
+        r["source_ids"] = merged
+        r["evidence_count"] = len(merged)
+        r["updated_at"] = now_iso()
+    elif kind == "activate":
+        r = find(rules, op["rule_id"])
+        r["status"] = "active"
+        r["updated_at"] = now_iso()
+    elif kind == "retire":
+        r = find(rules, op["rule_id"])
+        r["status"] = "retired"
+        r["updated_at"] = now_iso()
+    else:
+        raise SystemExit(f"error: unknown op '{kind}'")
+
+
+def write_rules(rules: list[dict]) -> None:
+    path = rules_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # one-snapshot undo: until the data dir is independently backed up (SPOF),
+    # keep the pre-apply state so a regretted patch can be reverted.
+    if path.exists():
+        path.replace(path.with_suffix(".jsonl.bak"))
+    tmp = path.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rules))
+    tmp.replace(path)  # atomic: no half-written rules.jsonl on error
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) != 1:
+        raise SystemExit("usage: distill-apply <patch.jsonl>")
+
+    rules = load_rules()
+    ops = load_patch(argv[0])
+    # validate-then-write: apply to an in-memory copy; any error aborts before
+    # touching rules.jsonl (see test_activate_unknown_rule_fails_and_writes_nothing).
+    for op in ops:
+        apply_op(rules, op)
+    write_rules(rules)
+
+    active = sum(1 for r in rules if r.get("status") == "active")
+    print(f"applied {len(ops)} op(s); {len(rules)} rules total, {active} active")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

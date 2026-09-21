@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""SessionStart hook: recall trigger for the judgment learning loop.
+
+If no judgment has been recorded recently, inject a one-line context asking
+Claude to check with the human (once, briefly) whether there is a judgment
+worth capturing. Silent when recording is active or already nagged today.
+The human stays the only source of log entries — this only prompts recall.
+"""
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+QUIET_HOURS = 24  # no nag if a judgment was recorded within this window
+NAG_INTERVAL_HOURS = 24  # at most one nag per this window
+DISTILL_PENDING_THRESHOLD = 3  # suggest distill when this many logs sit past the watermark
+DISTILL_STALE_DAYS = 7  # or when any pending log has waited this long
+
+
+def data_dir() -> Path:
+    return Path(os.environ.get("JUDGMENT_LOOP_DIR", Path.home() / ".local/share/judgment-loop"))
+
+
+def last_judgment_ts(log: Path):
+    if not log.exists():
+        return None
+    ts = None
+    with log.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ts = json.loads(line).get("ts") or ts
+            except json.JSONDecodeError:
+                continue
+    if ts is None:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def pending_distill(d: Path):
+    """Return (count, oldest_ts) of logs newer than the distill watermark."""
+    log = d / "judgments.jsonl"
+    if not log.exists():
+        return 0, None
+    watermark = ""
+    wm_file = d / ".distill-watermark"
+    if wm_file.exists():
+        watermark = wm_file.read_text().strip()
+    count, oldest = 0, None
+    with log.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # ids are j_YYYYMMDD_NNN, so lexical order matches chronology
+            if entry.get("id", "") > watermark:
+                count += 1
+                if oldest is None:
+                    try:
+                        oldest = datetime.fromisoformat(entry.get("ts", ""))
+                    except ValueError:
+                        pass
+    return count, oldest
+
+
+def distill_context(d: Path, now: datetime):
+    count, oldest = pending_distill(d)
+    if count == 0:
+        return None
+    stale = (
+        oldest is not None
+        and now - oldest.astimezone(timezone.utc) > timedelta(days=DISTILL_STALE_DAYS)
+    )
+    if count < DISTILL_PENDING_THRESHOLD and not stale:
+        return None
+    stamp = d / ".distill-nag"
+    if stamp.exists():
+        age = now - datetime.fromtimestamp(stamp.stat().st_mtime, tz=timezone.utc)
+        if age < timedelta(hours=NAG_INTERVAL_HOURS):
+            return None
+    stamp.touch()
+    return (
+        f"判断学習ループ: watermark 以降の未 distill な judgment が {count} 件溜まっている。"
+        "このセッションの区切りの良いタイミングで一度だけ、人間に"
+        "「/judgment-distill を実行するか」を短く確認すること。断られたらそれ以上聞かない。"
+    )
+
+
+def main() -> None:
+    d = data_dir()
+    now = datetime.now(timezone.utc)
+
+    distill = distill_context(d, now) if d.exists() else None
+
+    last = last_judgment_ts(d / "judgments.jsonl")
+    if last is not None and now - last.astimezone(timezone.utc) < timedelta(hours=QUIET_HOURS):
+        if distill:
+            emit(distill)
+        return  # loop is being fed; stay silent about recall
+
+    stamp = d / ".recall-nag"
+    if stamp.exists():
+        age = now - datetime.fromtimestamp(stamp.stat().st_mtime, tz=timezone.utc)
+        if age < timedelta(hours=NAG_INTERVAL_HOURS):
+            if distill:
+                emit(distill)
+            return  # already nagged recently
+    d.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+
+    context = (
+        "判断学習ループ: 直近24時間に judgment ログが記録されていない。"
+        "このセッションの区切りの良いタイミングで一度だけ、人間に"
+        "「前回までの作業で残すべき却下・修正・気付き(judge に記録する判断)はあるか」"
+        "と短く確認すること。人間が挙げた内容のみ judge CLI で記録し、"
+        "推論による代筆はしない。無ければそれ以上聞かない。"
+    )
+    if distill:
+        context = context + "\n" + distill
+    emit(context)
+
+
+def emit(context: str) -> None:
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    }, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)

@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      # Run the "試す" steps from README.md so the documented usage keeps working.
+      - name: README smoke test
+        env:
+          JUDGMENT_LOOP_DIR: ${{ runner.temp }}/judgment-loop
+        run: |
+          bin/judge reject --domain code-review --reason "新機能は実装から入らず、設計ドキュメントを先に起こす"
+          bin/judge revise --reason "ドキュメントに個人の絶対パスをコミットした" --fix "パスは書かず、ファイルの所在・性質で説明する"
+          bin/judge stats
+          bin/distill-apply examples/patch.sample.jsonl
+          grep -q '"status": "active"' "$JUDGMENT_LOOP_DIR/rules.jsonl"
